@@ -1,0 +1,72 @@
+name: Deploy and configure static website on storage account in Azure
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Login to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Create resource group
+      uses: azure/cli@v1
+      with:
+        inlineScript: |
+          az group create -l swedencentral -n demo-static-web-rg
+
+    - name: Create storage account
+      uses: azure/cli@v1
+      with:
+        inlineScript: |
+          az storage account create --name examensarbetedemostweb --resource-group demo-static-web-rg --location swedencentral --sku Standard_LRS
+
+    - name: Configure blob storage to server HTML
+      uses: azure/cli@v1
+      with:
+        inlineScript: |
+          az storage blob service-properties update --account-name examensarbetedemostweb --static-website --404-document error.html --index-document index.html
+
+    - name: Upload to blob storage
+      uses: azure/cli@v1
+      with:
+        inlineScript: |
+          az storage blob upload-batch \
+          --account-name examensarbetedemostweb \
+          --source frontend/ \
+          --destination '$web'
+    
+    - name: Get static website URL
+      id: static_website_url
+      uses: azure/cli@v1
+      with:
+        inlineScript: |
+          static_website_url=$(az storage account show --name examensarbetedemostweb --query "primaryEndpoints.web" -o tsv)
+          echo "::set-output name=static_website_url::$static_website_url"
+
+    - name: Trigger Logic App
+      run: |
+        tenantId=$(echo "${{ secrets.AZURE_CREDENTIALS }}" | grep '"tenantId"' | sed 's/.*: "\(.*\)".*/\1/')
+        clientId=$(echo "${{ secrets.AZURE_CREDENTIALS }}" | grep '"clientId"' | sed 's/.*: "\(.*\)".*/\1/')
+        clientSecret=$(echo "${{ secrets.AZURE_CREDENTIALS }}" | grep '"clientSecret"' | sed 's/.*: "\(.*\)".*/\1/')
+        resource="https://management.azure.com/"
+
+        url="https://login.microsoftonline.com/$tenantId/oauth2/token"
+        body="grant_type=client_credentials&client_id=$clientId&client_secret=$clientSecret&resource=$resource"
+
+        response=$(curl -sS -X POST -d "$body" -H "Content-Type: application/x-www-form-urlencoded" $url)
+        sas_token=$(echo $response | jq -r .access_token)
+
+        curl -X POST -H "Content-Type: application/json" -d '{"static_website_url": "'"${{ steps.static_website_url.outputs.static_website_url }}"'"}' "${{ secrets.LOGIC_APP_URL }}&Authorization=${sas_token}"
+    
+    - name: Logout of Azure
+      run: |
+        az logout
